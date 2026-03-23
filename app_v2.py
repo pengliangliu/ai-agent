@@ -3,20 +3,25 @@ import io
 import datetime
 import json
 import base64
-import zipfile
+import pandas as pd
+import fitz
 import streamlit as st
-
-# ⚠️ 仅保留轻量级的内置库和必须作为全局装饰器的基础工具类在最外层
+from docx import Document as DocxDocument
+from docx.enum.text import WD_COLOR_INDEX
+from docx.shared import RGBColor
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
+from langchain_core.documents import Document as LangchainDocument
+from langchain_community.vectorstores import FAISS
+from langchain_huggingface import HuggingFaceEmbeddings
+from ddgs import DDGS
 
 # ==========================================
 # 0. 核心配置区
 # ==========================================
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-# os.environ["http_proxy"] = "http://127.0.0.1:7890"
-# os.environ["https_proxy"] = "http://127.0.0.1:7890"
+
 # ==========================================
 # 1. 页面配置
 # ==========================================
@@ -67,45 +72,31 @@ def check_password():
 if check_password():
 
     # ==========================================
-    # 3. 性能优化与工具定义 (全面懒加载)
+    # 3. 性能优化与工具定义
     # ==========================================
-
     @st.cache_resource
     def load_embedding_model():
-        # 🚀 懒加载：极其沉重的 HuggingFace 嵌入模型只在建立索引时加载
-        from langchain_huggingface import HuggingFaceEmbeddings
         return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-
-
-    @st.cache_resource
-    def load_ocr_model():
-        # 🚀 懒加载：视觉模型
-        import easyocr
-        return easyocr.Reader(['ch_sim', 'en'], gpu=False)
 
 
     @tool
     def process_document_revision(action: str, original_text: str, revised_text: str, comment: str) -> str:
-        """【智能文档修改与批注工具】当用户同意修改已上传的文档方案时调用此工具！
+        """【智能文档修改与批注工具】当用户同意修改方案时调用！
         参数说明：
         - action (str): 填 "replace" 或 "append"。
-        - original_text (str): 需要修改的原文片段。
+        - original_text (str): 需要修改的原文片段（处理PDF时，请尽量提取短小精悍的关键词，避免使用包含换行的超长段落，否则会匹配失败）。
         - revised_text (str): 修改后的新文本。
-        - comment (str): 给用户的修改原因说明。
+        - comment (str): 给用户的说明。
         """
         if "current_file_path" not in st.session_state or not st.session_state.current_file_path:
-            return "操作失败：当前没有加载任何文档。如果用户想新建文档，请调用 create_new_word_document 工具。"
+            return "操作失败：当前没有加载任何文档。"
 
         source_path = st.session_state.current_file_path
         ext = os.path.splitext(source_path)[1].lower()
 
         try:
+            # 🌟 模式一：处理 Word 文档 (.docx)
             if ext == '.docx':
-                # 🚀 懒加载：文档处理库
-                from docx import Document as DocxDocument
-                from docx.enum.text import WD_COLOR_INDEX
-                from docx.shared import RGBColor
-
                 doc = DocxDocument(source_path)
                 modified_count = 0
 
@@ -138,14 +129,12 @@ if check_password():
                     st.session_state.latest_modified_ext = '.docx'
                     st.session_state.newly_modified_trigger = True
                     return f"成功：Word 文档已处理完毕。请回复：'文档已更新，请点击下方的蓝色按钮下载修订版。'"
-                return f"失败：未在 Word 文本中找到原文 '{original_text}'。"
+                return f"失败：未在原文档中找到原文片段 '{original_text}'。"
 
+            # 🌟 模式二：处理 PDF 文档 (.pdf)
             elif ext == '.pdf':
                 if action == 'append':
-                    return "操作提示：PDF 文件不支持直接追加章节，请记录在备忘录中。"
-
-                # 🚀 懒加载：PDF 处理库
-                import fitz
+                    return "操作提示：PDF 文件不支持直接追加章节，请告诉用户将内容写在备忘录里。"
 
                 doc = fitz.open(source_path)
                 modified_count = 0
@@ -159,6 +148,7 @@ if check_password():
                             annot.update()
                             modified_count += 1
                     else:
+                        # OCR 兜底模式
                         reader = load_ocr_model()
                         pix = page.get_pixmap(dpi=72)
                         ocr_results = reader.readtext(pix.tobytes("png"))
@@ -174,10 +164,14 @@ if check_password():
                                 modified_count += 1
 
                 if modified_count > 0:
+                    # 🚀 核心修复：将 PDF 压入内存字节，并立刻释放文件锁！
                     pdf_bytes = doc.write()
                     doc.close()
+
+                    # 覆写本地临时文件，实现“叠甲修改”
                     with open(source_path, "wb") as f:
                         f.write(pdf_bytes)
+
                     b64_data = base64.b64encode(pdf_bytes).decode()
 
                     st.session_state.latest_modified_b64 = b64_data
@@ -185,24 +179,30 @@ if check_password():
                     st.session_state.newly_modified_trigger = True
                     return f"成功：已在 PDF 中高亮错误并批注。请回复：'PDF 已完成审核批注，请点击下方的红色按钮下载带有批注的 PDF。'"
 
+                # 如果没找到，也要确保关掉文件，不然下次依然锁死
                 doc.close()
-                return f"失败：未在 PDF 中定位到原文。请尝试缩短 original_text 重试。"
+                return f"失败：未在 PDF 中定位到原文 '{original_text}'。由于 PDF 存在隐形换行符，请你尝试提取短小精悍的连续词组作为 original_text，再次调用本工具重试！"
 
         except Exception as e:
             return f"文档处理时发生系统错误: {str(e)}"
 
 
+    # 🌟 新增：从零开始生成全新 Word 文档的工具
     @tool
     def create_new_word_document(content: str, filename: str = "AI起草文档.docx") -> str:
-        """【创建新Word文档工具】当用户要求你起草、撰写、生成一份全新的Word文档（且没有上传源文件）时调用此工具。"""
+        """【创建新Word文档工具】当用户要求你起草、撰写、生成一份全新的Word文档（且没有上传源文件）时调用此工具。
+        参数说明：
+        - content (str): 要写入新文档的完整文本内容（支持用 Markdown 的 #, ## 标识标题层级）。
+        - filename (str): 生成的文件名，必须以 .docx 结尾。
+        """
         try:
-            # 🚀 懒加载：文档创建库
-            from docx import Document as DocxDocument
-
             doc = DocxDocument()
+
+            # 简单的 Markdown 层级解析引擎，让生成的 Word 排版更好看
             for line in content.split('\n'):
                 line = line.strip()
-                if not line: continue
+                if not line:
+                    continue
                 if line.startswith('# '):
                     doc.add_heading(line[2:].strip(), level=1)
                 elif line.startswith('## '):
@@ -214,11 +214,14 @@ if check_password():
                 else:
                     doc.add_paragraph(line)
 
-            if not filename.endswith('.docx'): filename += '.docx'
+            if not filename.endswith('.docx'):
+                filename += '.docx'
+
             word_buffer = io.BytesIO()
             doc.save(word_buffer)
             b64_data = base64.b64encode(word_buffer.getvalue()).decode()
 
+            # 存入纯内存状态
             st.session_state.latest_created_word_b64 = b64_data
             st.session_state.latest_created_word_filename = filename
             st.session_state.newly_created_word_trigger = True
@@ -246,11 +249,9 @@ if check_password():
     def search_latest_medical_regulations(query: str, time_limit: str = "m") -> str:
         """【互联网实时搜索工具】获取当前最新的法规、新闻。"""
         try:
-            # 🚀 懒加载：联网搜索库
-            from ddgs import DDGS
-
             results = DDGS().text(query, max_results=3, timelimit=time_limit)
-            if not results: return f"在 {time_limit} 范围内未能找到关于 '{query}' 的最新信息。"
+            if not results:
+                return f"在 {time_limit} 范围内未能找到关于 '{query}' 的最新信息。"
             formatted_results = "\n\n".join(
                 [f"标题: {res['title']}\n摘要: {str(res.get('body', ''))[:150]}...\n链接: {res['href']}" for res in
                  results])
@@ -263,9 +264,6 @@ if check_password():
     def generate_excel_matrix(json_data: str) -> str:
         """【Excel生成工具】生成NC整改矩阵。"""
         try:
-            # 🚀 懒加载：沉重的数据分析库 Pandas
-            import pandas as pd
-
             data = json.loads(json_data)
             df = pd.DataFrame(data)
             excel_buffer = io.BytesIO()
@@ -275,9 +273,9 @@ if check_password():
             st.session_state.latest_excel_b64 = b64_data
             st.session_state.newly_generated_excel_trigger = True
 
-            return "成功：Excel矩阵已生成。请回复：'表格已为您生成，请点击下方的绿色按钮直接下载。'"
+            return "成功：Excel矩阵已在内存中生成。请回复：'表格已为您生成，请点击下方的绿色按钮直接下载。'"
         except Exception as e:
-            return f"生成 Excel 时发生错误: {str(e)}。"
+            return f"生成 Excel 时发生错误: {str(e)}。请检查传入的 JSON 格式。"
 
 
     @tool
@@ -290,11 +288,13 @@ if check_password():
                 doc_name = "Word" if ext == ".docx" else "PDF"
                 return f"已触发 {doc_name} 下载按钮，请告诉用户：'文档链接已为您重新生成，请点击下方按钮获取。'"
             return "当前没有已修改的文档可供下载。"
+
         elif file_type.lower() == 'excel':
             if st.session_state.get("latest_excel_b64"):
                 st.session_state.newly_generated_excel_trigger = True
                 return "已触发 Excel 下载按钮，请告诉用户：'表格下载链接已为您重新生成，请点击下方绿色按钮获取。'"
             return "当前没有内存中的 Excel 表格可供下载。"
+
         return "未知的文件类型。请仅请求 doc 或 excel。"
 
 
@@ -317,55 +317,19 @@ if check_password():
 
 
     def process_document_to_vector_db(file_path):
-        # 🚀 懒加载：Langchain 的重型文档处理与向量库引擎
-        from langchain_core.documents import Document as LangchainDocument
-        from langchain_community.vectorstores import FAISS
-
         docs = []
         ext = os.path.splitext(file_path)[1].lower()
 
         if ext == '.pdf':
-            # 🚀 懒加载：PDF 解析引擎
-            import fitz
             doc = fitz.open(file_path)
             for i, page in enumerate(doc):
                 text = page.get_text("text")
-                if len(text.strip()) < 50 or len(page.get_images()) > 0:
-                    reader = load_ocr_model()
-                    pix = page.get_pixmap(dpi=150)
-                    ocr_results = reader.readtext(pix.tobytes("png"))
-                    ocr_text = "\n".join([res[1] for res in ocr_results])
-                    if ocr_text.strip():
-                        text = text + f"\n[插图/扫描件视觉识别内容]:\n{ocr_text}"
-
                 if len(text.strip()) > 5:
                     docs.append(LangchainDocument(page_content=text, metadata={"page": i + 1}))
-
         elif ext == '.docx':
-            # 🚀 懒加载：Word 解析引擎
-            from docx import Document as DocxDocument
             doc = DocxDocument(file_path)
             paragraphs = [p.text for p in doc.paragraphs if len(p.text.strip()) > 5]
-            text_content = "\n".join(paragraphs)
-            if len(text_content) > 5:
-                docs.append(LangchainDocument(page_content=text_content, metadata={"source": "text"}))
-
-            try:
-                with zipfile.ZipFile(file_path) as docx_zip:
-                    for item in docx_zip.namelist():
-                        if item.startswith('word/media/') and item.lower().endswith(('.png', '.jpeg', '.jpg', '.bmp')):
-                            image_data = docx_zip.read(item)
-                            reader = load_ocr_model()
-                            ocr_results = reader.readtext(image_data)
-                            img_text = "\n".join([res[1] for res in ocr_results])
-                            if len(img_text.strip()) > 2:
-                                docs.append(LangchainDocument(
-                                    page_content=f"[Word内部插图视觉识别]:\n{img_text}",
-                                    metadata={"source": "image_inside_word"}
-                                ))
-            except Exception as e:
-                print(f"Word 图片读取失败: {e}")
-
+            docs = [LangchainDocument(page_content=text) for text in paragraphs]
         else:
             return None
 
@@ -378,7 +342,7 @@ if check_password():
     # ==========================================
     # 4. 状态初始化与主界面布局
     # ==========================================
-    st.title("🤖 医疗器械法规 Agent (极致性能版)")
+    st.title("🤖 医疗器械法规 Agent")
 
     if "current_file_path" not in st.session_state: st.session_state.current_file_path = None
     if "current_file_name" not in st.session_state: st.session_state.current_file_name = None
@@ -388,6 +352,8 @@ if check_password():
     if "latest_modified_b64" not in st.session_state: st.session_state.latest_modified_b64 = None
     if "latest_modified_ext" not in st.session_state: st.session_state.latest_modified_ext = None
     if "latest_excel_b64" not in st.session_state: st.session_state.latest_excel_b64 = None
+
+    # 🌟 新增：凭空生成 Word 的状态
     if "latest_created_word_b64" not in st.session_state: st.session_state.latest_created_word_b64 = None
     if "latest_created_word_filename" not in st.session_state: st.session_state.latest_created_word_filename = None
 
@@ -413,7 +379,7 @@ if check_password():
                 st.session_state.current_file_path = save_path
                 st.session_state.current_file_name = uploaded_file.name
 
-                with st.spinner("正在启动视觉引擎，深度解析图文内容..."):
+                with st.spinner("正在逐字解析文档并建立大脑索引..."):
                     st.session_state.vector_db = process_document_to_vector_db(save_path)
                 st.success(f"已加载并解析: {uploaded_file.name}")
         else:
@@ -448,9 +414,9 @@ if check_password():
             st.rerun()
 
     if st.session_state.current_file_name:
-        st.info(f"📄 **当前文档:** `{st.session_state.current_file_name}` | 🧠 **阅读状态:** 图文已载入记忆。")
+        st.info(f"📄 **当前文档:** `{st.session_state.current_file_name}` | 🧠 **阅读状态:** 已载入记忆。")
     else:
-        st.info("💡 **当前未加载文档。** 您可以上传图文混排的 PDF/Word 进行修改，也可以让我为您【凭空起草】一份全新文档。")
+        st.info("💡 **当前未加载文档。** 您可以上传文档进行修改，也可以直接与我聊天")
 
     # ==========================================
     # 6. Agent 聊天与核心调度逻辑
@@ -460,28 +426,29 @@ if check_password():
     current_board = st.session_state.task_board if st.session_state.task_board else "暂无内容"
 
     system_prompt = f"""你是一个全能的AI智能助理，核心专长是资深医疗器械合规专家。
-    【重要时间认知】：今天是真实的 {real_today}。
-    【当前文档状态】：{doc_status}
-    【全局备忘录内容】：{current_board}
+        【重要时间认知】：今天是真实的 {real_today}。
+        【当前文档状态】：{doc_status}
+        【全局备忘录内容】：{current_board}
 
-    🚫 【绝对禁令】（违背以下原则将被视为严重故障）：
-    1. 你**绝对有能力**读取和修改用户上传的 Word 和 PDF 文件！当用户问“我上传的文件是干嘛的”或让你查阅文档时，你必须立刻调用 `search_document_content` 工具，**绝不允许**告诉用户“我无法接收文件附件”或“请复制粘贴文本”！
-    2. 你的修改能力没有技术限制！**绝不允许**对用户说“由于系统技术限制需要手动修改”。
+        🚫 【绝对禁令】（违背以下原则将被视为严重故障）：
+        1. 你**绝对有能力**读取和修改用户上传的 Word 和 PDF 文件！当用户问“我上传的文件是干嘛的”或让你查阅文档时，你必须立刻调用 `search_document_content` 工具，**绝不允许**告诉用户“我无法接收文件附件”或“请复制粘贴文本”！
+        2. 你的修改能力没有技术限制！**绝不允许**对用户说“由于系统技术限制需要手动修改”。
 
-    你的工作模式：
-    1. 【起草文档】：当用户没有上传文件要求起草文档时，调用 `create_new_word_document`。
-    2. 【处理已有文档】：当用户要求审查已上传文档时，调用 `search_document_content` 并在发现多个错误时：
-       - 第一步：必须先调用 `update_task_board` 写进备忘录！然后停下来询问用户先改哪一条。
-       - 第二步：当用户指定修改时，调用 `process_document_revision`。
-    3. 【生成表格】：调用 `generate_excel_matrix` 生成 Excel 文件。
-    4. 【联网搜索】：调用 `search_latest_medical_regulations` 获取最新信息。
-    """
+        你的工作模式：
+        1. 【起草文档】：当用户没有上传文件要求起草文档时，调用 `create_new_word_document`。
+        2. 【文档处理与分步策略】：发现文档有【多个错误】需要修改时：
+           - 第一步：你必须先调用 `update_task_board` 工具，把所有需要整改的问题列入侧边栏备忘录。
+           - 第二步：主动对用户说：“我已经把所有问题列在左侧备忘录了，为了保证准确性，咱们逐一修改，请问先从哪一条开始？”
+           - 第三步：当用户指定修改某一条时，调用 `process_document_revision` 执行修改。改完后，询问用户是否继续修改备忘录里的下一条。
+        3. 【生成表格】：调用 `generate_excel_matrix` 生成 Excel 文件。
+        4. 【召唤链接】：调用 `get_file_download_link` 重新调出历史下载按钮。
+        """
 
     if "messages" not in st.session_state:
         st.session_state.messages = [
             SystemMessage(content=system_prompt),
             AIMessage(
-                content="你好！我的**底层引擎已完成极限重构（全局懒加载架构）**。现在只有在您真正使用对应功能时，系统才会悄悄调用深层模型，网页响应速度已飙升至巅峰！⚡")
+                content="你好！只要告诉我您的需求")
         ]
     else:
         if len(st.session_state.messages) > 0 and isinstance(st.session_state.messages[0], SystemMessage):
@@ -526,6 +493,7 @@ if check_password():
                 stop_btn_container = st.empty()
                 message_placeholder = st.empty()
                 ai_msg_chunk = None
+
                 status_text = "AI 正在思考..." if current_loop == 1 else "AI 正在分析执行结果..."
 
                 with stop_btn_container.container():
@@ -537,7 +505,6 @@ if check_password():
                     st.session_state.messages.append(AIMessage(content=""))
                     current_msg_idx = len(st.session_state.messages) - 1
 
-                    chunk_counter = 0
                     for chunk in llm_with_tools.stream(current_messages):
                         if ai_msg_chunk is None:
                             ai_msg_chunk = chunk
@@ -546,8 +513,7 @@ if check_password():
 
                         st.session_state.messages[current_msg_idx] = ai_msg_chunk
 
-                        chunk_counter += 1
-                        if chunk_counter % 4 == 0 and ai_msg_chunk.content:
+                        if ai_msg_chunk.content:
                             message_placeholder.markdown(ai_msg_chunk.content + " ▌", unsafe_allow_html=True)
 
                 if ai_msg_chunk and ai_msg_chunk.content:
@@ -580,18 +546,25 @@ if check_password():
             # ==========================================
             # 🌟 拦截器：渲染纯内存下载按钮
             # ==========================================
+
+            # 1. 拦截 Excel 下载
             if st.session_state.get("newly_generated_excel_trigger") and st.session_state.get("latest_excel_b64"):
                 b64 = st.session_state.latest_excel_b64
                 filename = "NC_Rectification_Matrix.xlsx"
+
                 html_link = f'<div style="margin-top: 15px;"><a href="data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,{b64}" download="{filename}" target="_blank" style="display: inline-block; padding: 10px 20px; background-color: #00A67E; color: white; text-align: center; text-decoration: none; border-radius: 6px; font-weight: bold;">📊 点击这里直接下载 Excel 矩阵表</a></div>'
                 st.markdown(html_link, unsafe_allow_html=True)
+
                 if len(st.session_state.messages) > 0 and isinstance(st.session_state.messages[-1], AIMessage):
                     st.session_state.messages[-1].content += "\n\n" + html_link
+
                 st.session_state.newly_generated_excel_trigger = False
 
+            # 2. 拦截修改过的源文档下载
             if st.session_state.get("newly_modified_trigger") and st.session_state.get("latest_modified_b64"):
                 b64 = st.session_state.latest_modified_b64
                 ext = st.session_state.latest_modified_ext
+
                 if ext == '.docx':
                     filename = f"revised_{st.session_state.current_file_name}"
                     btn_color = "#0052CC"
@@ -605,15 +578,22 @@ if check_password():
 
                 html_link = f'<div style="margin-top: 15px;"><a href="data:{mime_type};base64,{b64}" download="{filename}" target="_blank" style="display: inline-block; padding: 10px 20px; background-color: {btn_color}; color: white; text-align: center; text-decoration: none; border-radius: 6px; font-weight: bold;">{btn_text}</a></div>'
                 st.markdown(html_link, unsafe_allow_html=True)
+
                 if len(st.session_state.messages) > 0 and isinstance(st.session_state.messages[-1], AIMessage):
                     st.session_state.messages[-1].content += "\n\n" + html_link
+
                 st.session_state.newly_modified_trigger = False
 
+            # 3. 🌟 新增：拦截全新起草的 Word 下载
             if st.session_state.get("newly_created_word_trigger") and st.session_state.get("latest_created_word_b64"):
                 b64 = st.session_state.latest_created_word_b64
                 filename = st.session_state.latest_created_word_filename
+
+                # 用深蓝色与“修改源文件”的普通蓝色做轻微视觉区分
                 html_link = f'<div style="margin-top: 15px;"><a href="data:application/vnd.openxmlformats-officedocument.wordprocessingml.document;base64,{b64}" download="{filename}" target="_blank" style="display: inline-block; padding: 10px 20px; background-color: #003399; color: white; text-align: center; text-decoration: none; border-radius: 6px; font-weight: bold;">📄 点击这里下载新建的 Word 文档</a></div>'
                 st.markdown(html_link, unsafe_allow_html=True)
+
                 if len(st.session_state.messages) > 0 and isinstance(st.session_state.messages[-1], AIMessage):
                     st.session_state.messages[-1].content += "\n\n" + html_link
+
                 st.session_state.newly_created_word_trigger = False
