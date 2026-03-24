@@ -9,3 +9,4 @@ pandas
 python_docx
 streamlit
 frontend
+sentence-transformers
