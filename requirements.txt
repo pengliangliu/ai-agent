@@ -1,6 +1,6 @@
 ddgs
 easyocr
-fitz
+pymupdf
 langchain_community
 langchain_core
 langchain_huggingface
