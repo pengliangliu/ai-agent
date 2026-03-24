@@ -1,6 +1,6 @@
 ddgs
 easyocr
-fitz
+fitz==0.0.1.dev2
 langchain_community==0.4.1
 langchain_core==1.2.20
 langchain_huggingface==1.2.1
