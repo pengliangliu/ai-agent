@@ -8,3 +8,4 @@ langchain_openai
 pandas
 python_docx
 streamlit
+frontend
