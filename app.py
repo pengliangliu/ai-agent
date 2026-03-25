@@ -15,8 +15,7 @@ from langchain_core.tools import tool
 # 0. 核心配置区
 # ==========================================
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-# os.environ["http_proxy"] = "http://127.0.0.1:7890"
-# os.environ["https_proxy"] = "http://127.0.0.1:7890"
+
 # ==========================================
 # 1. 页面配置
 # ==========================================
@@ -72,21 +71,19 @@ if check_password():
 
     @st.cache_resource
     def load_embedding_model():
-        # 🚀 懒加载：极其沉重的 HuggingFace 嵌入模型只在建立索引时加载
         from langchain_huggingface import HuggingFaceEmbeddings
         return HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
 
 
     @st.cache_resource
     def load_ocr_model():
-        # 🚀 懒加载：视觉模型
         import easyocr
         return easyocr.Reader(['ch_sim', 'en'], gpu=False)
 
 
     @tool
     def process_document_revision(action: str, original_text: str, revised_text: str, comment: str) -> str:
-        """【智能文档修改与批注工具】当用户同意修改已上传的文档方案时调用此工具！
+        """【智能文档修改与批注工具】当用户同意修改方案时调用此工具！
         参数说明：
         - action (str): 填 "replace" 或 "append"。
         - original_text (str): 需要修改的原文片段。
@@ -94,14 +91,13 @@ if check_password():
         - comment (str): 给用户的修改原因说明。
         """
         if "current_file_path" not in st.session_state or not st.session_state.current_file_path:
-            return "操作失败：当前没有加载任何文档。如果用户想新建文档，请调用 create_new_word_document 工具。"
+            return "操作失败：当前没有加载任何文档。"
 
         source_path = st.session_state.current_file_path
         ext = os.path.splitext(source_path)[1].lower()
 
         try:
             if ext == '.docx':
-                # 🚀 懒加载：文档处理库
                 from docx import Document as DocxDocument
                 from docx.enum.text import WD_COLOR_INDEX
                 from docx.shared import RGBColor
@@ -118,6 +114,7 @@ if check_password():
                     run_comment.font.color.rgb = RGBColor(255, 0, 0)
                     modified_count += 1
                 else:
+                    # 1. 扫描并替换【普通正文】
                     for paragraph in doc.paragraphs:
                         if original_text and original_text in paragraph.text:
                             paragraph.text = paragraph.text.replace(original_text, revised_text)
@@ -128,6 +125,49 @@ if check_password():
                             run_comment.font.color.rgb = RGBColor(255, 0, 0)
                             modified_count += 1
 
+                    # 2. 扫描并替换【表格内容】
+                    for table in doc.tables:
+                        for row in table.rows:
+                            for cell in row.cells:
+                                for paragraph in cell.paragraphs:
+                                    if original_text and original_text in paragraph.text:
+                                        paragraph.text = paragraph.text.replace(original_text, revised_text)
+                                        for run in paragraph.runs:
+                                            if revised_text in run.text:
+                                                run.font.highlight_color = WD_COLOR_INDEX.YELLOW
+                                        modified_count += 1
+
+                    # 3. 🌟 扫描并替换【历史批注内容】 (修复版：手撕原生二进制 blob)
+                    try:
+                        from lxml import etree
+                        WORD_NS = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+
+                        for rel in doc.part.rels.values():
+                            if "comments" in rel.reltype:
+                                comments_part = rel.target_part
+                                # 读取未解析的二进制字节流并手动解析为 XML 树
+                                root = etree.fromstring(comments_part.blob)
+
+                                for c_node in root.findall('.//w:comment', namespaces=WORD_NS):
+                                    t_nodes = c_node.findall('.//w:t', namespaces=WORD_NS)
+                                    if not t_nodes: continue
+
+                                    # 提取完整批注文字
+                                    full_comment_text = "".join(node.text for node in t_nodes if node.text)
+                                    if original_text in full_comment_text:
+                                        new_comment_text = full_comment_text.replace(original_text, revised_text)
+
+                                        # 写入新文字到第一个节点，清空其余节点防截断
+                                        t_nodes[0].text = new_comment_text
+                                        for node in t_nodes[1:]:
+                                            node.text = ""
+                                        modified_count += 1
+
+                                # 将修改后的 XML 树重新转为二进制流，强行覆写到底层对象中
+                                comments_part._blob = etree.tostring(root, xml_declaration=True, encoding='UTF-8')
+                    except Exception as e:
+                        print(f"修改批注时发生警告: {e}")
+
                 if modified_count > 0:
                     doc.save(source_path)
                     word_buffer = io.BytesIO()
@@ -137,16 +177,13 @@ if check_password():
                     st.session_state.latest_modified_b64 = b64_data
                     st.session_state.latest_modified_ext = '.docx'
                     st.session_state.newly_modified_trigger = True
-                    return f"成功：Word 文档已处理完毕。请回复：'文档已更新，请点击下方的蓝色按钮下载修订版。'"
-                return f"失败：未在 Word 文本中找到原文 '{original_text}'。"
+                    return f"成功：Word 文档（含正文/表格/批注）已修改完毕。请回复：'文档已更新，请点击下方的蓝色按钮下载修订版。'"
+                return f"失败：未在 Word 中找到原文 '{original_text}'。"
 
             elif ext == '.pdf':
                 if action == 'append':
                     return "操作提示：PDF 文件不支持直接追加章节，请记录在备忘录中。"
-
-                # 🚀 懒加载：PDF 处理库
                 import fitz
-
                 doc = fitz.open(source_path)
                 modified_count = 0
                 for page in doc:
@@ -194,11 +231,9 @@ if check_password():
 
     @tool
     def create_new_word_document(content: str, filename: str = "AI起草文档.docx") -> str:
-        """【创建新Word文档工具】当用户要求你起草、撰写、生成一份全新的Word文档（且没有上传源文件）时调用此工具。"""
+        """【创建新Word文档工具】当用户要求起草全新Word文档（且无源文件）时调用。"""
         try:
-            # 🚀 懒加载：文档创建库
             from docx import Document as DocxDocument
-
             doc = DocxDocument()
             for line in content.split('\n'):
                 line = line.strip()
@@ -246,9 +281,7 @@ if check_password():
     def search_latest_medical_regulations(query: str, time_limit: str = "m") -> str:
         """【互联网实时搜索工具】获取当前最新的法规、新闻。"""
         try:
-            # 🚀 懒加载：联网搜索库
             from ddgs import DDGS
-
             results = DDGS().text(query, max_results=3, timelimit=time_limit)
             if not results: return f"在 {time_limit} 范围内未能找到关于 '{query}' 的最新信息。"
             formatted_results = "\n\n".join(
@@ -263,9 +296,7 @@ if check_password():
     def generate_excel_matrix(json_data: str) -> str:
         """【Excel生成工具】生成NC整改矩阵。"""
         try:
-            # 🚀 懒加载：沉重的数据分析库 Pandas
             import pandas as pd
-
             data = json.loads(json_data)
             df = pd.DataFrame(data)
             excel_buffer = io.BytesIO()
@@ -317,7 +348,6 @@ if check_password():
 
 
     def process_document_to_vector_db(file_path):
-        # 🚀 懒加载：Langchain 的重型文档处理与向量库引擎
         from langchain_core.documents import Document as LangchainDocument
         from langchain_community.vectorstores import FAISS
 
@@ -325,7 +355,6 @@ if check_password():
         ext = os.path.splitext(file_path)[1].lower()
 
         if ext == '.pdf':
-            # 🚀 懒加载：PDF 解析引擎
             import fitz
             doc = fitz.open(file_path)
             for i, page in enumerate(doc):
@@ -337,19 +366,52 @@ if check_password():
                     ocr_text = "\n".join([res[1] for res in ocr_results])
                     if ocr_text.strip():
                         text = text + f"\n[插图/扫描件视觉识别内容]:\n{ocr_text}"
-
                 if len(text.strip()) > 5:
                     docs.append(LangchainDocument(page_content=text, metadata={"page": i + 1}))
 
         elif ext == '.docx':
-            # 🚀 懒加载：Word 解析引擎
             from docx import Document as DocxDocument
             doc = DocxDocument(file_path)
-            paragraphs = [p.text for p in doc.paragraphs if len(p.text.strip()) > 5]
+
+            # 1. 提取正文
+            paragraphs = [p.text.strip() for p in doc.paragraphs if len(p.text.strip()) > 2]
+
+            # 2. 提取表格
+            for table in doc.tables:
+                for row in table.rows:
+                    row_data = []
+                    for cell in row.cells:
+                        txt = cell.text.strip()
+                        if txt and txt not in row_data:
+                            row_data.append(txt)
+                    if row_data:
+                        paragraphs.append(" | ".join(row_data))
+
             text_content = "\n".join(paragraphs)
             if len(text_content) > 5:
                 docs.append(LangchainDocument(page_content=text_content, metadata={"source": "text"}))
 
+            # 3. 🌟 提取隐藏在 XML 里的历史批注！(修复版)
+            try:
+                from lxml import etree
+                WORD_NS = {'w': 'http://schemas.openxmlformats.org/wordprocessingml/2006/main'}
+
+                for rel in doc.part.rels.values():
+                    if "comments" in rel.reltype:
+                        comments_part = rel.target_part
+                        # 直接读取原生二进制 blob 并解析
+                        root = etree.fromstring(comments_part.blob)
+
+                        for c_node in root.findall('.//w:comment', namespaces=WORD_NS):
+                            t_nodes = c_node.findall('.//w:t', namespaces=WORD_NS)
+                            comment_text = "".join(node.text for node in t_nodes if node.text)
+                            if len(comment_text.strip()) > 2:
+                                docs.append(LangchainDocument(page_content=f"[Word原文档里的历史批注]:\n{comment_text}",
+                                                              metadata={"source": "comment"}))
+            except Exception as e:
+                print(f"读取批注失败: {e}")
+
+            # 4. 提取插图文字 (OCR)
             try:
                 with zipfile.ZipFile(file_path) as docx_zip:
                     for item in docx_zip.namelist():
@@ -364,8 +426,7 @@ if check_password():
                                     metadata={"source": "image_inside_word"}
                                 ))
             except Exception as e:
-                print(f"Word 图片读取失败: {e}")
-
+                pass
         else:
             return None
 
@@ -413,7 +474,7 @@ if check_password():
                 st.session_state.current_file_path = save_path
                 st.session_state.current_file_name = uploaded_file.name
 
-                with st.spinner("正在启动视觉引擎，深度解析图文内容..."):
+                with st.spinner("正在启动视觉引擎与XML探针，全息解析文档..."):
                     st.session_state.vector_db = process_document_to_vector_db(save_path)
                 st.success(f"已加载并解析: {uploaded_file.name}")
         else:
@@ -448,7 +509,7 @@ if check_password():
             st.rerun()
 
     if st.session_state.current_file_name:
-        st.info(f"📄 **当前文档:** `{st.session_state.current_file_name}` | 🧠 **阅读状态:** 图文已载入记忆。")
+        st.info(f"📄 **当前文档:** `{st.session_state.current_file_name}` | 🧠 **阅读状态:** 图文与批注已载入记忆。")
     else:
         st.info("💡 **当前未加载文档。** 您可以上传图文混排的 PDF/Word 进行修改，也可以让我为您【凭空起草】一份全新文档。")
 
@@ -464,15 +525,13 @@ if check_password():
     【当前文档状态】：{doc_status}
     【全局备忘录内容】：{current_board}
 
-    🚫 【绝对禁令】（违背以下原则将被视为严重故障）：
-    1. 你**绝对有能力**读取和修改用户上传的 Word 和 PDF 文件！当用户问“我上传的文件是干嘛的”或让你查阅文档时，你必须立刻调用 `search_document_content` 工具，**绝不允许**告诉用户“我无法接收文件附件”或“请复制粘贴文本”！
-    2. 你的修改能力没有技术限制！**绝不允许**对用户说“由于系统技术限制需要手动修改”。
+    🚫 【绝对禁令】：你**绝对有能力**读取用户上传的文档里的所有正文、表格、隐藏批注和图片文字。绝不允许对用户说“我无法接收文件”或“系统技术限制”。
 
     你的工作模式：
     1. 【起草文档】：当用户没有上传文件要求起草文档时，调用 `create_new_word_document`。
     2. 【处理已有文档】：当用户要求审查已上传文档时，调用 `search_document_content` 并在发现多个错误时：
        - 第一步：必须先调用 `update_task_board` 写进备忘录！然后停下来询问用户先改哪一条。
-       - 第二步：当用户指定修改时，调用 `process_document_revision`。
+       - 第二步：当用户指定修改时，调用 `process_document_revision`。该工具不仅能修改正文，还能直接定位并修改 Word 里的历史批注内容。
     3. 【生成表格】：调用 `generate_excel_matrix` 生成 Excel 文件。
     4. 【联网搜索】：调用 `search_latest_medical_regulations` 获取最新信息。
     """
@@ -481,7 +540,7 @@ if check_password():
         st.session_state.messages = [
             SystemMessage(content=system_prompt),
             AIMessage(
-                content="你好！我的**底层引擎已完成极限重构（全局懒加载架构）**。现在只有在您真正使用对应功能时，系统才会悄悄调用深层模型，网页响应速度已飙升至巅峰！⚡")
+                content="你好！经过底层 XML 数据拆解升级，现在不管是在 Word 隐藏的表格里，还是历史遗留的批注里，所有的文字我都能完美读取并且帮你一键修改！快丢份沾满前人批注的复杂文档给我试试吧！")
         ]
     else:
         if len(st.session_state.messages) > 0 and isinstance(st.session_state.messages[0], SystemMessage):
